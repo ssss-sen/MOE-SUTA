@@ -1,0 +1,1 @@
+python run_benchmark.py -s csuta -t LS_VC_5 --strategy_config config/strategy/1step.yaml

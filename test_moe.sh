@@ -1,0 +1,1 @@
+python run_benchmark.py -s moe_suta -t LS_VC_5 -n moe_1 --config config/system/moe-suta.yaml --strategy_config config/strategy/5step.yaml
