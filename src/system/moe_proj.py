@@ -169,6 +169,8 @@ class MoELinearLayer(nn.Module):
         self.cnt = torch.zeros(num_expert, device=device)
         self.lb_loss = None
         self.route_prob_list = []
+        self.record_route = False
+
 
         if grad_hook:
             hook_fn = self.make_step_aware_hook(f"linear_layer{self.idx}", self)
@@ -273,7 +275,8 @@ class MoELinearLayer(nn.Module):
 
         self.update_coeff(coeff)
         self.topks = topks
-        self.route_prob_list.append(prob.detach().cpu())
+        if self.record_route:
+            self.route_prob_list.append(prob.detach().cpu())
 
     def step_once(self):
         self.step += 1
@@ -299,20 +302,18 @@ class MoELinearLayer(nn.Module):
             coeff_flat = self.coeff
             topks_flat = self.topks
             
-        # 融合出 Batch*Time 动态专家权重
-        final_weight, final_bias = fuse_linear_params(
-            self.experts_weight,
-            self.experts_bias,
-            topks_flat,
-            coeff_flat,
-            self.weight,
-            self.bias,
-            self.has_bias
-        )
-
-        # 执行带有动态权重的 Linear 运算
-        result_flat = apply_linear(x_flat, final_weight, final_bias, self.has_bias)
+        # BUG-010 fix: 不物化 [B*T, Out, In] 逐帧融合权重（O(BT*D^2) 显存爆炸）。
+        # 数学等价式: y = x@W_shared^T + b_shared + Σ_e c_{.,e} * (x@E_e^T + b_e)
+        # （coeff 对未选中专家为 0，故 Σ_e 实际只在 top-k 上生效；内存降为 O(BT*D)）
+        bias = self.bias if self.has_bias else None
+        out = F.linear(x_flat, self.weight, bias)
+        e_bias = self.experts_bias if self.has_bias else None
+        for e in range(self.num_expert):
+            c_e = coeff_flat[:, e].unsqueeze(-1)          # (BT, 1)
+            eb = None if e_bias is None else e_bias[e]
+            delta_e = F.linear(x_flat, self.experts_weight[e], eb)
+            out = out + c_e * delta_e
 
         if is_3d:
-            return result_flat.reshape(B, T, -1)
-        return result_flat
+            return out.reshape(B, T, -1)
+        return out

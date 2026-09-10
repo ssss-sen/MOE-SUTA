@@ -205,6 +205,8 @@ class MoEConv1dLayer(nn.Module):
         self.cnt = torch.zeros(num_expert, device=device)
         self.lb_loss = None
         self.route_prob_list = []
+        self.record_route = False
+
 
 
     def get_trainable_params(self):
@@ -227,14 +229,15 @@ class MoEConv1dLayer(nn.Module):
         """
         B, in_C, L = x.shape
         # 根据本层一秒的时长推断需要分为多少个Block
-        num_blocks = math.ceil(L / self.frames_per_sec)
+        fps = max(1, int(self.frames_per_sec))
+        num_blocks = math.ceil(L / fps)
 
         # 将序列补齐到帧率的整数倍，方便路由池化
-        pad_len = (self.frames_per_sec - (L % self.frames_per_sec)) % self.frames_per_sec
+        pad_len = (fps - (L % fps)) % fps
         x_pad_route = F.pad(x, (0, pad_len))
         
         # 重塑并对每个 Block 在时间维度上求均值: [B, in_C, num_blocks, F] -> [B, num_blocks, in_C]
-        x_blocks = x_pad_route.view(B, in_C, num_blocks, self.frames_per_sec)
+        x_blocks = x_pad_route.view(B, in_C, num_blocks, fps)
         block_feats = x_blocks.mean(dim=-1).transpose(1, 2)
         
         # 展平为 [B*num_blocks, in_C] 进行路由预测
@@ -262,7 +265,8 @@ class MoEConv1dLayer(nn.Module):
         
         self.update_coeff(coeff)
         self.topks = topks
-        self.route_prob_list.append(prob.detach().cpu())
+        if self.record_route:
+            self.route_prob_list.append(prob.detach().cpu())
         
         return num_blocks
 
@@ -275,7 +279,7 @@ class MoEConv1dLayer(nn.Module):
         if self.router is not None:
             num_blocks = self.get_topks(x)
         else:
-            num_blocks = math.ceil(L / self.frames_per_sec)
+            num_blocks = math.ceil(L / max(1, self.frames_per_sec))
             
         # topks 和 coeff 现在的形状都是 [B * num_blocks, K 或 E]
         # 融合出每一块专属于该时段的权重: shape = [B * num_blocks, out_C, in_C/g, K]

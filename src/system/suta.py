@@ -204,12 +204,12 @@ class SUTASystem(object):
             loss += d_loss * self.config["div_coef"]
             record["d_loss"] = d_loss.item()
         
-        record["total_loss"] = loss.item()
-
         if self.config["l2_coef"] > 0: 
             l2_loss = self.l2_loss()
             loss += l2_loss * self.config["l2_coef"]
             record["l2_loss"] = l2_loss.item()
+
+        record["total_loss"] = loss.item()
 
         self.model.zero_grad()
         loss.backward()
@@ -257,12 +257,12 @@ class SUTASystem(object):
             loss += d_loss * self.config["div_coef"]
             record["d_loss"] = d_loss.item()
         
-        record["total_loss"] = loss.item()
-
         if self.config["l2_coef"] > 0: 
             l2_loss = self.l2_loss()
             loss += l2_loss * self.config["l2_coef"]
             record["l2_loss"] = l2_loss.item()
+
+        record["total_loss"] = loss.item()
 
         return loss
 
@@ -270,7 +270,7 @@ class SUTASystem(object):
         """ suta_adapt auto split to smaller batch """
         self.adapt_count += 1
         if batch_size == -1:
-            batch_size == len(wavs)
+            batch_size = len(wavs)
         self.model.zero_grad()
         denom_scale = len(wavs) // batch_size
         assert denom_scale > 0
@@ -329,7 +329,7 @@ class SUTASystem(object):
         """ ctc_adapt auto split to smaller batch """
         self.adapt_count += 1
         if batch_size == -1:
-            batch_size == len(wavs)
+            batch_size = len(wavs)
         self.model.zero_grad()
         denom_scale = len(wavs) // batch_size
         assert denom_scale > 0
@@ -353,7 +353,15 @@ class SUTASystem(object):
         inputs = inputs.to(device=self.model.device)
         
         # 前向传播：在 MoETTA 内部会自动计算 valid_mask 和 moe_loss
-        outputs = self.model(**inputs)
+        # （eval 下默认不产统计量；适应时显式打开，模型仍保持 eval/dropout=off）
+        prev_flag = getattr(self.model, "collect_stats", False)
+        self.model.collect_stats = True
+        try:
+            # 温度对齐：MoETTA 内部熵/valid_mask/coeff 与下方 MCC 使用同一 temp（默认2.5）
+            self.model.current_temp = float(self.config.get("temp", 2.5))
+            outputs = self.model(**inputs)
+        finally:
+            self.model.collect_stats = prev_flag
         predicted_ids = torch.argmax(outputs.logits, dim=-1)
 
         loss = 0
@@ -599,7 +607,14 @@ class SUTASystem(object):
                     params.append(p)
                     names.append(f"{nm}.{np}")
 
-        return params, names
+        # 按参数去重（train_LN 与 train_feature 分支会把同一参数收集多份）
+        seen, unique_params, unique_names = set(), [], []
+        for p, n in zip(params, names):
+            if id(p) not in seen:
+                seen.add(id(p))
+                unique_params.append(p)
+                unique_names.append(n)
+        return unique_params, unique_names
 
 
 def setup_optimizer(params, opt_name='AdamW', lr=1e-4, beta=0.9, weight_decay=0., scheduler=None, step_size=1, gamma=0.7):

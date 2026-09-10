@@ -16,7 +16,7 @@ def mcc_loss(x, reweight=False, dim=2, class_num=32):
         target_entropy_weight = x.shape[1] * target_entropy_weight / torch.sum(target_entropy_weight)
         cov_matrix_t = torch.matmul(p.mul(target_entropy_weight.unsqueeze(-1)).transpose(2, 1), p)
     else:    
-        cov_matrix_t = p.transpose(2, 1).mm(p) # (B, D, L) * (B, L, D) -> (B, D, D)
+        cov_matrix_t = torch.matmul(p.transpose(2, 1), p) # (B, D, L) * (B, L, D) -> (B, D, D)
 
     cov_matrix_t = cov_matrix_t / torch.sum(cov_matrix_t, dim=-1, keepdim=True)
     tr = 0

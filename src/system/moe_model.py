@@ -8,7 +8,8 @@ from .moe_conv import MoEConv1dLayer
 from .moe_normalization import MoENormalizationLayer
 from .moe_proj import MoELinearLayer
 from .router import MLPRouter
-from .utils import set_nested_attr, softmax_entropy
+from .utils import set_nested_attr
+from .loss import softmax_entropy
 
 
 class MoETTA(nn.Module):
@@ -95,6 +96,10 @@ class MoETTA(nn.Module):
         self.entropys = []
         self.probs = []
         self.biased_probs = []
+        # 日志/统计防泄漏：默认不记录；可视化调试时再置 keep_log=True
+        self.keep_log = False
+        self._ent_sum = 0.0
+        self._ent_n = 0
         self.cnt = torch.zeros(self.num_expert).to(self.device)
         self.filtered_cnt = 0
         self.construct_model()
@@ -114,22 +119,24 @@ class MoETTA(nn.Module):
 
         self.model.requires_grad_(False)
         idx = 0
-        current_fps = self.frames_per_sec
+        current_fps = float(self.audio_sample_rate)   # raw 波形 16000 samples/s
 
         for name, mod in self.model.named_modules():
             if isinstance(mod, nn.Conv1d):
                 if idx in self.disabled_layer and idx in self.normal_layer:
                     raise ValueError(f"{idx} is both in disabled layer and normal layer")
+                stride = mod.stride[0] if isinstance(mod.stride, tuple) else mod.stride
                 if idx in self.disabled_layer:
                     idx += 1
+                    current_fps = current_fps / stride   # disabled 层也降低分辨率
                     continue
                 if idx in self.normal_layer:
                     idx += 1
                     mod.requires_grad_(True)
                     self.normal_layers.append(mod)
+                    current_fps = current_fps / stride
                     continue
-                
-                stride = mod.stride[0] if isinstance(mod.stride, tuple) else mod.stride
+
                 new_mod = MoEConv1dLayer(
                     idx=idx,
                     num_expert=self.num_expert,
@@ -145,11 +152,10 @@ class MoETTA(nn.Module):
                     device=self.device,
                     grad_hook=self.grad_hook,
                     pass_through_coeff=self.pass_through_coeff,
-                    frames_per_sec=int(current_fps),
+                    frames_per_sec=int(current_fps),   # 该层输入每秒样本数 → 每块≈1秒
                 )
                 set_nested_attr(self.model, name, new_mod)
                 idx += 1
-                # 更新供下一层卷积使用的 fps
                 current_fps = current_fps / stride
 
             elif isinstance(mod, (nn.BatchNorm2d, nn.LayerNorm, nn.GroupNorm)):
@@ -185,35 +191,17 @@ class MoETTA(nn.Module):
                 idx += 1
 
             elif isinstance(mod, nn.Linear):
-                if idx in self.disabled_layer or idx < self.global_router_idx:
-                    idx += 1
-                    continue
+                # BUG-004 决策 B-2：Linear 保持为原始共享层，不 MoE 化。
+                # 理由：MoETTA 论文只专家化 LayerNorm；本仓库 SUTA 基线也只更新 feature conv+LN、
+                # encoder 线性权重冻结 —— 因此 MoE-SUTA 与 SUTA 的可比差异应落在 LN/conv 的专家增量上。
+                # 若需要放开某些 Linear 作为普通可训练层，把其 idx 配进 normal_layer 即可。
                 if idx in self.normal_layer:
                     idx += 1
                     mod.requires_grad_(True)
                     self.normal_layers.append(mod)
                     continue
-                new_mod = MoELinearLayer(
-                    idx=idx, 
-                    num_expert=self.num_expert, 
-                    activate_shared_expert=self.activate_shared_expert,
-                    base_mod=mod, 
-                    randomness=self.randomness, 
-                    self_router=self.self_router, 
-                    samplewise=self.samplewise, 
-                    topk=self.topk, 
-                    weight_by_prob=self.weight_by_prob, 
-                    penalty=self.route_penalty, 
-                    decay=self.decay,
-                    grad_hook=self.grad_hook, 
-                    pass_through_coeff=self.pass_through_coeff,
-                    device=self.device, 
-                    frames_per_sec=int(current_fps) # 传入帧率，支持按块分割
-                )
-                if idx == self.global_router_idx:
-                    new_mod.register_forward_pre_hook(router_hook)
-                set_nested_attr(self.model, name, new_mod)
                 idx += 1
+                continue
         self.moe_layer = [
             mod
             for mod in self.model.modules()
@@ -290,7 +278,7 @@ class MoETTA(nn.Module):
 
     def forward(self, *args, **kwargs):
         output = self.model(*args, **kwargs)
-        if not self.training:
+        if not (self.training or getattr(self, "collect_stats", False)):
             return output
         logits = output.logits if hasattr(output, 'logits') else output
         lb_loss = self.collect_lb_loss().sum()
@@ -302,25 +290,31 @@ class MoETTA(nn.Module):
             self.current_coeff = 1 / (torch.exp(entropy.detach() - self.e_margin_coeff * math.log(1000)))
         else:
             self.current_coeff = 1.0  # 标量
-        self.output_list.append(logits.detach().cpu())
+        if self.keep_log:
+            self.output_list.append(logits.detach().cpu())
 
+        # 防泄漏：累计均值替代只增不清的 entropys 列表（new/old = 全体样本平均熵 更新后/更新前）
         mean_entropy = entropy.detach().mean()
-        if len(self.entropys) == 0:
-            self.entropys.append(mean_entropy)
-        else:
-            old_avg = torch.stack(self.entropys).detach().mean().item()
-            self.entropys.append(mean_entropy)
-            new_avg = torch.stack(self.entropys).detach().mean().item()
-        if self.dynamic_threshold:
-            if len(self.entropys) == 1:
+        mean_entropy_f = float(mean_entropy.item())
+        if self._ent_n == 0:
+            self._ent_n = 1
+            self._ent_sum = mean_entropy_f
+            if self.dynamic_threshold:
                 self.threshold = mean_entropy
-            else:
-                self.threshold *= new_avg / old_avg
-        if self.dynamic_lb:
-            if len(self.entropys) == 1:
+            if self.dynamic_lb:
                 self.lb_coeff = mean_entropy * self.lb_coeff
-            else:
-                self.lb_coeff *= new_avg / old_avg
+        else:
+            old_avg = self._ent_sum / self._ent_n
+            self._ent_sum += mean_entropy_f
+            self._ent_n += 1
+            new_avg = self._ent_sum / self._ent_n
+            ratio = new_avg / old_avg
+            if self.dynamic_threshold:
+                self.threshold = self.threshold * ratio
+            if self.dynamic_lb:
+                self.lb_coeff = self.lb_coeff * ratio
+        if not hasattr(self, "threshold"):
+            self.threshold = mean_entropy
         valid_mask = (entropy <= self.threshold)
         entropy_filtered = entropy[valid_mask]
         self.valid_mask = valid_mask
@@ -335,8 +329,9 @@ class MoETTA(nn.Module):
         self.step_once()
 
         if not self.self_router:
-            self.probs.append(self.route_prob)
-            self.biased_probs.append(self.biased_prob)
+            if self.keep_log:
+                self.probs.append(self.route_prob)
+                self.biased_probs.append(self.biased_prob)
             route_prob_max, selected = torch.topk(self.biased_prob, self.topk)
             self.cnt[selected] += 1
             

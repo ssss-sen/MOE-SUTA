@@ -105,7 +105,6 @@ class SUTAStrategy(IStrategy):
             # losses.append(loss)
 
             self._update(sample)
-        self.system.save("/root/autodl-tmp/model/CSUTA/VC/model.pt")
             
         print("#Too long: ", long_cnt)
         

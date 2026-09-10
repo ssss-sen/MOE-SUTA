@@ -5,7 +5,6 @@ os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 import librosa
 from datasets import load_dataset
 from tqdm import tqdm
-from scipy.io import wavfile
 import json
 import shutil
 from datasets import Audio
@@ -60,7 +59,7 @@ def libirspeech_preprocess():
             target_sr=16000
         )
         basename = f"{idx:07d}"
-        wavfile.write(f"{cache_dir}/wav/{basename}.wav", 16000, (wav * 32767).astype(np.int16))
+        sf.write(f"{cache_dir}/wav/{basename}.wav", (wav * 32767).astype(np.int16), 16000)
         with open(f"{cache_dir}/text/{basename}.txt", "w", encoding="utf-8") as f:
             f.write(instance["text"])
         data_info.append({
@@ -117,7 +116,7 @@ def sythesize(noise_type: str, snr_level=10):
 
         wav_path = f"{output_dir}/wav/{query['basename']}.wav"
         text_path = f"{output_dir}/text/{query['basename']}.txt"
-        wavfile.write(wav_path, 16000, (noisy_wav * 32767).astype(np.int16))
+        sf.write(wav_path, (noisy_wav * 32767).astype(np.int16), 16000)
         with open(text_path, "w", encoding="utf-8") as f:
             f.write(query['text'])
     shutil.copyfile(f"{clean_dir}/data_info.json", f"{output_dir}/data_info.json")

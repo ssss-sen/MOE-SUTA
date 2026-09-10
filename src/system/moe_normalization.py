@@ -59,7 +59,25 @@ def apply_layernorm(
     else:
         raise NotImplementedError
 
-
+@torch.jit.script
+def fuse_params_samplewise(
+    experts_weight: torch.Tensor,   # (E, D)
+    experts_bias: torch.Tensor,     # (E, D)
+    topks: torch.Tensor,            # (B, K)
+    coeff: torch.Tensor,            # (B, E)
+    shared_weight: torch.Tensor,    # (D,)
+    shared_bias: torch.Tensor,      # (D,)
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    B, K = topks.shape
+    D = experts_weight.size(1)
+    expanded_w = experts_weight.unsqueeze(0).expand(B, -1, -1)
+    sel_w = expanded_w.gather(1, topks.unsqueeze(-1).expand(B, K, D))
+    c = coeff.gather(1, topks).unsqueeze(-1)                 # (B,K,1)
+    final_w = (sel_w * c).sum(1) + shared_weight.unsqueeze(0)  # (B,D)
+    expanded_b = experts_bias.unsqueeze(0).expand(B, -1, -1)
+    sel_b = expanded_b.gather(1, topks.unsqueeze(-1).expand(B, K, D))
+    final_b = (sel_b * c).sum(1) + shared_bias.unsqueeze(0)    # (B,D)
+    return final_w, final_b
 @torch.jit.script
 def apply_batchnorm(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float
@@ -91,23 +109,43 @@ def apply_groupnorm(
     bias: torch.Tensor,
     eps: float,
 ) -> torch.Tensor:
-    B, C, H, W = x.shape
-    G = num_groups
-    assert C % G == 0, "channels must be divisible by num_groups"
-
-    x = x.view(B, G, -1)
-
-    mean = x.mean(dim=-1, keepdim=True)
-    var = x.var(dim=-1, unbiased=False, keepdim=True)
-
-    x_norm = (x - mean) / torch.sqrt(var + eps)
-    x_norm = x_norm.view(B, C, H, W)
-
-    weight = weight.view(B, C, 1, 1)
-    bias = bias.view(B, C, 1, 1)
-
-    out = x_norm * weight + bias
-    return out
+    if x.dim() == 3:
+        # 3D 输入 (B, C, L)：wav2vec2 GroupNormConvLayer 的形态
+        B, C, L = x.shape
+        G = num_groups
+        assert C % G == 0, "channels must be divisible by num_groups"
+        xr = x.view(B, G, -1)
+        mean = xr.mean(dim=-1, keepdim=True)
+        var = xr.var(dim=-1, unbiased=False, keepdim=True)
+        xn = (xr - mean) / torch.sqrt(var + eps)
+        xn = xn.view(B, C, L)
+        if weight.dim() == 2:          # 逐样本融合权重 (B,C)
+            return xn * weight.unsqueeze(-1) + bias.unsqueeze(-1)
+        elif weight.dim() == 1:        # 共享/退化权重 (C,)
+            return xn * weight.view(1, C, 1) + bias.view(1, C, 1)
+        else:
+            raise NotImplementedError("groupnorm 3D: unsupported weight rank")
+    elif x.dim() == 4:
+        # 原 4D (B,C,H,W) 逻辑保留
+        B, C, H, W = x.shape
+        G = num_groups
+        assert C % G == 0, "channels must be divisible by num_groups"
+        xv = x.view(B, G, -1)
+        mean = xv.mean(dim=-1, keepdim=True)
+        var = xv.var(dim=-1, unbiased=False, keepdim=True)
+        x_norm = (xv - mean) / torch.sqrt(var + eps)
+        x_norm = x_norm.view(B, C, H, W)
+        if weight.dim() == 2:
+            weight = weight.view(B, C, 1, 1)
+            bias = bias.view(B, C, 1, 1)
+        elif weight.dim() == 1:
+            weight = weight.view(1, C, 1, 1)
+            bias = bias.view(1, C, 1, 1)
+        else:
+            raise NotImplementedError("groupnorm 4D: unsupported weight rank")
+        return x_norm * weight + bias
+    else:
+        raise NotImplementedError(f"unsupported x.dim()={x.dim()}")
 
 
 class MoENormalizationLayer(nn.Module):
@@ -175,7 +213,8 @@ class MoENormalizationLayer(nn.Module):
             self.router = nn.Linear(in_features, num_expert, device=device)
             nn.init.xavier_normal_(self.router.weight)
             nn.init.zeros_(self.router.bias)
-
+        else:
+            self.router = None
         # 路由配置
         self.samplewise = samplewise
         self.topk = topk
@@ -190,6 +229,8 @@ class MoENormalizationLayer(nn.Module):
         self.cnt = torch.zeros(num_expert, device=device)
         self.lb_loss = None
         self.route_prob_list = []
+        self.record_route = False
+
         self.cls_feature = None
 
         # 可选梯度钩子注册略
@@ -313,25 +354,31 @@ class MoENormalizationLayer(nn.Module):
         self.lb_loss = self.num_expert * (prob.mean(0) * (cnt / cnt.sum())).sum()
         self.update_coeff(coeff)
         self.topks = topks
-        self.route_prob_list.append(prob.detach().cpu())
+        if self.record_route:
+            self.route_prob_list.append(prob.detach().cpu())
 
     def step_once(self):
         self.step += 1
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        assert (self.router is not None) or (self.coeff is not None), (
-            "需要路由器或融合系数"
-        )
         if self.router is not None:
             self.get_topks(x)
-        final_weight, final_bias = fuse_params(
-            self.experts_weight,
-            self.experts_bias,
-            self.topks,
-            self.coeff,
-            self.weight,
-            self.bias,
-        )
+        assert (self.coeff is not None) and (self.topks is not None), "no routing info"
+
+        if self.coeff.dim() == 3:
+            # 逐帧/外部 3D coeff: (B,T,E)/(B,T,K)
+            final_weight, final_bias = fuse_params(
+                self.experts_weight, self.experts_bias,
+                self.topks, self.coeff,
+                self.weight, self.bias)
+        elif self.coeff.dim() == 2:
+            # 逐样本 2D coeff: (B,E)/(B,K) —— 方案 A 主路径
+            final_weight, final_bias = fuse_params_samplewise(
+                self.experts_weight, self.experts_bias,
+                self.topks, self.coeff,
+                self.weight, self.bias)
+        else:
+            raise ValueError(f"unexpected coeff.dim={self.coeff.dim()}")
 
         if isinstance(self.base_mod, nn.LayerNorm):
             result = apply_layernorm(x, final_weight, final_bias, self.base_mod.eps)

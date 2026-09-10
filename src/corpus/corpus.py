@@ -8,7 +8,7 @@ from datasets import load_dataset
 from tqdm import tqdm
 import re
 from builtins import str as unicode
-from scipy.io import wavfile
+import soundfile as sf
 import pickle
 
 from . import Define
@@ -167,7 +167,7 @@ class CommonVoiceCorpus(object):
                 orig_sr=src_dataset.features["audio"].sampling_rate,
                 target_sr=16000
             )
-            wavfile.write(f"{self.cache_dir}/wav/{idx:07d}.wav", 16000, (wav * 32767).astype(np.int16))
+            sf.write(f"{self.cache_dir}/wav/{idx:07d}.wav", (wav * 32767).astype(np.int16), 16000)
             with open(f"{self.cache_dir}/text/{idx:07d}.txt", "w", encoding="utf-8") as f:
                 f.write(instance["sentence"])
             basenames.append(f"{idx:07d}")
@@ -259,7 +259,7 @@ class TEDCorpus(object):
                 orig_sr=src_dataset.features["audio"].sampling_rate,
                 target_sr=16000
             )
-            wavfile.write(f"{self.cache_dir}/wav/{cnt:07d}.wav", 16000, (wav * 32767).astype(np.int16))
+            sf.write(f"{self.cache_dir}/wav/{cnt:07d}.wav", (wav * 32767).astype(np.int16), 16000)
             with open(f"{self.cache_dir}/text/{cnt:07d}.txt", "w", encoding="utf-8") as f:
                 f.write(instance["text"])
             basenames.append(f"{cnt:07d}")
