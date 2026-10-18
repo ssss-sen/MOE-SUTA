@@ -1,0 +1,4 @@
+steps: 3
+max_length: 320000
+update_freq: 5
+memory: 5

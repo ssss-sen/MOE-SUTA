@@ -1,7 +1,7 @@
 model_name: "/root/autodl-tmp/model/wav2vec2"
 
 opt: AdamW
-lr: 0.00002
+lr: 0.000005
 scheduler: null
 
 em_coef: 0.3
@@ -14,6 +14,8 @@ reweight: True
 bias_only: False
 temp: 2.5
 l2_coef: 0
+blank_coef: 0.5
+nb_threshold: 0.2
 
 use_moe: True
 

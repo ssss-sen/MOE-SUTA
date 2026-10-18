@@ -13,7 +13,7 @@ MULTIDOMAIN = {
     "md_hard": (f"{SRC_DIR}/librispeech_c.py", "MDHARD1"),
     "md_hard-100": (f"{SRC_DIR}/librispeech_c.py", "MDHARD2"),
     "md_hard-20": (f"{SRC_DIR}/librispeech_c.py", "MDHARD3"),
-    "md_long": (f"{SRC_DIR}/librispeech_c.py", "MDLONG"),
+    "md_long": (f"{SRC_DIR}/librispeech_c.py", "MDLong"),  # [FIX-17] 类名是 MDLong，旧值 "MDLONG" 会 AttributeError
 }
 
 BASIC = {

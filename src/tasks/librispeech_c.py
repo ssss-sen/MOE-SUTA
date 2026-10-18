@@ -10,7 +10,7 @@ class RandomSequence(Dataset):
         self.corpus = LibriSpeechCCorpus(root=root)
         self.idx_seq = list(range(len(self.corpus)))
         self.task_boundaries = []
-        #random.shuffle(self.idx_seq)
+        random.shuffle(self.idx_seq)
 
     def __len__(self):
         return len(self.corpus)

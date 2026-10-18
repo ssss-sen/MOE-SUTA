@@ -229,36 +229,28 @@ class MoELinearLayer(nn.Module):
         return params
 
     def get_topks(self, x: torch.Tensor):
+        """逐样本路由：整条序列一个决策。"""
         B = x.size(0)
-        
         if x.dim() == 3:
             T = x.size(1)
             F_chunk = self.frames_per_sec
-            
-            # 【以 Block 为单位池化特征】
             chunks = torch.split(x, F_chunk, dim=1)
-            block_feats = [chunk.mean(dim=1) for chunk in chunks]
-            block_feat = torch.stack(block_feats, dim=1) # [B, num_blocks, In]
-            num_blocks = block_feat.shape[1]
-            
-            flat = block_feat.view(B * num_blocks, -1)
+            chunk_means = torch.stack([c.mean(dim=1) for c in chunks], dim=1)  # [B, nb, In]
+            flat = chunk_means.mean(dim=1)                                     # [B, In]
         else:
-            # 兼容非时间序列的二维输入
             T = 1
-            F_chunk = 1
-            num_blocks = 1
             flat = x
 
-        prob = F.softmax(self.router(flat), dim=-1) # [B*num_blocks, E]
+        prob = F.softmax(self.router(flat), dim=-1)               # [B, E]
         biased = prob - self.penalty
-        vals, topks = torch.topk(biased, self.topk, dim=-1)
+        vals, topks = torch.topk(biased, self.topk, dim=-1)       # [B, K]
 
-        coeff = torch.zeros((B * num_blocks, self.num_expert), device=prob.device)
+        coeff = torch.zeros((B, self.num_expert), device=prob.device)
         if self.weight_by_prob:
             coeff.scatter_(1, topks, vals / vals.detach().sum(-1, keepdim=True))
         else:
             coeff.scatter_(1, topks, vals / vals.detach())
-            
+
         cnt = torch.bincount(topks.flatten(), minlength=self.num_expert)
         self.cnt += cnt
         self.penalty += cnt * self.route_penalty / (1 + self.decay * self.step)
@@ -266,12 +258,8 @@ class MoELinearLayer(nn.Module):
         self.lb_loss = self.num_expert * (prob.mean(0) * (cnt / cnt.sum())).sum()
 
         if x.dim() == 3:
-            coeff = coeff.view(B, num_blocks, self.num_expert)
-            topks = topks.view(B, num_blocks, self.topk)
-            # 扩展为 [B, num_blocks * F_chunk, E]，再截断回 T
-            coeff = coeff.unsqueeze(2).expand(-1, -1, F_chunk, -1).reshape(B, num_blocks * F_chunk, self.num_expert)[:, :T, :]
-            topks = topks.unsqueeze(2).expand(-1, -1, F_chunk, -1).reshape(B, num_blocks * F_chunk, self.topk)[:, :T, :]
-
+            coeff = coeff.expand(-1, T, -1)      # [B, T, E]
+            topks = topks.expand(-1, T, -1)      # [B, T, K]
 
         self.update_coeff(coeff)
         self.topks = topks

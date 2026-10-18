@@ -81,6 +81,11 @@ class SUTASystem(object):
                 normal_layer=normal_layers,
                 pass_through_coeff=moe_cfg.get("pass_through_coeff", True),
                 global_router_idx=moe_cfg.get("global_router_idx", -1),
+                lb_window=int(moe_cfg.get("lb_window", 1) or 1),  # [V1-lbwindow]
+                batch_route=bool(moe_cfg.get("batch_route", False)),          # [BR]
+                batch_route_momentum=float(moe_cfg.get("batch_route_momentum", 0.5)),  # [BR]
+                route_granularity=str(moe_cfg.get("route_granularity", "native") or "native"),  # [RG]
+                expert_schedule=str(moe_cfg.get("expert_schedule", "") or ""),                # [ES]
                 device=config.get("device", "cuda")
             )
         
@@ -104,6 +109,41 @@ class SUTASystem(object):
     def eval(self):
         self.model.eval()
 
+    # ==================== [EXPERT_LR_PATCH] ====================
+    # 把官方 MoETTA 的 lr 值施加在【专家 + router】上，其余保持本仓库实测最优的 lr。
+    # 门控：环境变量 MOE_EXPERT_LR（默认不设 => 单 param_group，行为与历史结果逐位一致）
+    def _apply_expert_lr(self, params):
+        import os
+        exp_lr = os.environ.get("MOE_EXPERT_LR", "").strip()
+        base_lr = self.config.get("lr", None)
+        if not exp_lr:
+            return params
+        if base_lr is None:
+            print("[EXPERT_LR] config most lr key => fallback single group", flush=True)
+            return params
+        exp_lr, base_lr = float(exp_lr), float(base_lr)
+        ex_ids = set()
+        layers = getattr(self.model, "moe_layer", None) or []
+        for m in layers:
+            for nm in ("experts_weight", "experts_bias"):
+                _p = getattr(m, nm, None)
+                if isinstance(_p, torch.nn.Parameter):
+                    ex_ids.add(id(_p))
+            _r = getattr(m, "router", None)
+            if _r is not None:
+                for _p in _r.parameters():
+                    ex_ids.add(id(_p))
+        grp_ex = [p for p in params if id(p) in ex_ids]
+        grp_rest = [p for p in params if id(p) not in ex_ids]
+        if not grp_ex:
+            print("[EXPERT_LR] WARN no experts/router matched => fallback single group", flush=True)
+            return params
+        _m = lambda g: sum(p.numel() for p in g) / 1e6
+        print("[EXPERT_LR] expert/router lr=%.3e (rest lr=%.3e, =%.0fx) | grp=%d tensors/%.3fM | rest=%d tensors/%.3fM"
+              % (exp_lr, base_lr, (exp_lr / base_lr) if base_lr else -1.0,
+                 len(grp_ex), _m(grp_ex), len(grp_rest), _m(grp_rest)), flush=True)
+        return [{"params": grp_rest}, {"params": grp_ex, "lr": exp_lr}]
+
     def build_optimized_model(self):
         if self.is_moe:
             params = self.model.get_params()
@@ -111,7 +151,8 @@ class SUTASystem(object):
             for p in params:
                 p.requires_grad = True
             print("MoE Optimizable Params: ", sum(p.numel() for p in params))
-            return params
+            # [EXPERT_LR_PATCH]
+            return self._apply_expert_lr(params)
         else:
             self.model.requires_grad_(False)
             params, self.opt_param_names = self.collect_params()
@@ -158,10 +199,20 @@ class SUTASystem(object):
     def l2_loss(self):
         l2_loss = 0.0
         orig_state_dict = self.history["init"][0]
-
+        _cache = getattr(self, "_l2_init_dev", None)
+        if _cache is None:
+            _cache = self._l2_init_dev = {}
         for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                l2_loss += torch.sum((param - orig_state_dict[name]) ** 2)
+            if not param.requires_grad:
+                continue
+            _ref = _cache.get(name)
+            if _ref is None or _ref.device != param.device:
+                _cand = orig_state_dict.get(name)
+                if _cand is None:
+                    continue
+                _ref = _cand.to(param.device)
+                _cache[name] = _ref
+            l2_loss += torch.sum((param - _ref) ** 2)
         return l2_loss
 
     def suta_adapt(self, wavs, record={}):
@@ -364,75 +415,126 @@ class SUTASystem(object):
             self.model.collect_stats = prev_flag
         predicted_ids = torch.argmax(outputs.logits, dim=-1)
 
+        # EXP-F：完全采用 SUTA 原版损失（无权熵 on 非blank、MCC 全帧、无 LB、无置信度掩码）
         loss = 0
-        
-        # 获取 MoETTA 内部算好的合法样本掩码 (布尔值张量)
-        if hasattr(self.model, 'valid_mask'):
-            valid_mask = self.model.valid_mask
-        else:
-            valid_mask = torch.ones_like(predicted_ids, dtype=torch.bool)
 
-        # 1. 计算原生的 Entropy Loss
         if self.config["em_coef"] > 0:
-            x = self.model.current_entropy
-            coeff = self.model.current_coeff
-            
-            x_valid = x[valid_mask]
-            coeff_valid = coeff[valid_mask] if isinstance(coeff, torch.Tensor) else coeff
-            valid_predicted_ids = predicted_ids[valid_mask]
-            
-            if self.config.get("non_blank", False):
-                non_blank_mask = (valid_predicted_ids != 0)
-                x_valid = x_valid[non_blank_mask]
-                if isinstance(coeff_valid, torch.Tensor):
-                    coeff_valid = coeff_valid[non_blank_mask]
-            
-            if x_valid.numel() > 0:
-                e_loss = (coeff_valid * x_valid).mean()
+            non_blank = torch.where(predicted_ids != 0, 1, 0).bool()
+            x = softmax_entropy(outputs.logits / self.config["temp"])
+            if self.config["non_blank"]:
+                x = x[non_blank]
+            if len(x) > 0:
+                e_loss = x.mean(0).mean()
             else:
-                e_loss = torch.tensor(0.0, device=self.model.device)
+                e_loss = torch.tensor(0, device=self.model.device)
                 record["collapse"] = True
-                
             loss += e_loss * self.config["em_coef"]
             record["e_loss"] = e_loss.item()
 
-        # 2. 加上 MoE 的负载均衡损失 (LB Loss)
-        if hasattr(self.model, 'moe_lb_loss'):
-            lb_loss = self.model.moe_lb_loss
-            loss += lb_loss  # lb_coeff 在 MoETTA 内部已经乘过
-            record["lb_loss"] = lb_loss.item()
+        if 1 - self.config["em_coef"] > 0:
+            c_loss = mcc_loss(outputs.logits / self.config["temp"], self.config["reweight"])
+            loss += c_loss * (1 - self.config["em_coef"])
+            record["c_loss"] = c_loss.item()
 
+        if self.config["div_coef"] > 0:
+            d_loss = div_loss(outputs.logits, self.config["non_blank"])
+            loss += d_loss * self.config["div_coef"]
+            record["d_loss"] = d_loss.item()
 
-        # 3. MCC Loss 与 DIV Loss
-        valid_logits = outputs.logits[valid_mask]
-        
-        if valid_logits.numel() > 0:
-            if self.config.get("non_blank", False):
-                non_blank_mask = (valid_predicted_ids != 0)
-                valid_logits_for_extra = valid_logits[non_blank_mask]
-            else:
-                valid_logits_for_extra = valid_logits
-
-            if valid_logits_for_extra.numel() == 0:
-                if "collapse" not in record:
-                    record["collapse"] = True
-            else:
-                valid_logits_for_extra = valid_logits_for_extra.unsqueeze(0)
-
-                if 1 - self.config.get("em_coef", 1.0) > 0:
-                    c_loss = mcc_loss(valid_logits_for_extra / self.config.get("temp", 1.0), self.config.get("reweight", False))
-                    loss += c_loss * (1 - self.config.get("em_coef", 1.0))
-                    record["c_loss"] = c_loss.item()
-
-                if self.config.get("div_coef", 0.0) > 0:
-                    d_loss = div_loss(valid_logits_for_extra, non_blank=False) 
-                    loss += d_loss * self.config.get("div_coef", 0.0)
-                    record["d_loss"] = d_loss.item()
-        
-        if self.config.get("l2_coef", 0.0) > 0: 
+        if self.config.get("l2_coef", 0.0) > 0:
             l2_loss = self.l2_loss()
             loss += l2_loss * self.config.get("l2_coef", 0.0)
             record["l2_loss"] = l2_loss.item()
+
+        # [BLANK_FOR_BASELINE] 给基线策略补上与 MoE 路径一致的"反 blank"项。
+        #   默认 blank_coef 不存在 ⇒ 0 ⇒ 不加（历史结果完全不变）；显式 --set blank_coef=0.5 才启用。
+        _bc = float(self.config.get("blank_coef", 0.0) or 0.0)
+        if _bc > 0:
+            nb_ratio = (predicted_ids != 0).float().mean()
+            blank_prob = outputs.logits.softmax(-1)[..., 0].mean()
+            record["nb_ratio"] = nb_ratio.item()
+            if nb_ratio < self.config.get("nb_threshold", 0.2):
+                loss = loss + _bc * blank_prob
+                record["blank_penalty"] = blank_prob.item()
+
+        # EXP-J: 反 blank 项（非blank帧比例过低时惩罚 blank 概率，抑制 CTC 空白坍缩）
+        nb_ratio = (predicted_ids != 0).float().mean()
+        blank_prob = outputs.logits.softmax(-1)[..., 0].mean()
+        record["nb_ratio"] = nb_ratio.item()
+        if nb_ratio < self.config.get("nb_threshold", 0.2):
+            loss = loss + self.config.get("blank_coef", 0.1) * blank_prob
+            record["blank_penalty"] = blank_prob.item()
+        # [MOETTA_FILTER] 官方 MoETTA 的"动态阈值过滤 + 熵重加权"（Eq.8-10）
+        #   用模型 forward 已算好的 valid_mask / current_coeff；env MOE_MOETTA_FILTER=1 才启用（默认关）
+        #   实现：loss += (加权熵 − 原熵)·em_coef ⇒ 等价于把熵项替换成 Eq.9 的形式
+        import os as _os
+        if _os.environ.get("MOE_MOETTA_FILTER", "0") == "1" and self.config["em_coef"] > 0:
+            _vm = getattr(self.model, "valid_mask", None)
+            _cw = getattr(self.model, "current_coeff", None)
+            if _vm is not None and _cw is not None:
+                _H2 = softmax_entropy(outputs.logits / self.config["temp"])
+                _m = _vm if not self.config["non_blank"] else (_vm & (predicted_ids != 0))
+                _e_f = None
+                if int(_m.sum()) > 0:
+                    _e_f = (_H2[_m] * _cw[_m]).sum() / _m.sum()
+                    loss = loss + (_e_f - e_loss.detach()) * self.config["em_coef"]
+                    record["e_loss_filtered"] = float(_e_f.item())
+                self._mf_n = getattr(self, "_mf_n", 0) + 1
+                _nb = int((predicted_ids != 0).sum())
+                valid_n = int(_vm.sum())
+                if self._mf_n % 500 == 0:
+                    print("[MF2] n=%d | S_t=%d | valid=%d | nonblank=%d | 帧=%d | 保留(全体)=%.1f%% 保留(nb)=%.1f%%"
+                          % (self._mf_n, int(_m.sum()), valid_n, _nb, int(_m.numel()),
+                             100.0*int(_m.sum())/max(1,int(_m.numel())), 100.0*int(_m.sum())/max(1,_nb)), flush=True)
+                    print("[MF] n=%d | 可靠帧=%d/%d (%.1f%%) | 加权熵=%s | 原熵=%.4f"
+                          % (self._mf_n, int(_m.sum()), int(_m.numel()),
+                             100.0 * float(_m.sum()) / max(1, int(_m.numel())),
+                             ("%.4f" % float(_e_f.item())) if _e_f is not None else "n/a",
+                             float(e_loss.item())), flush=True)
+        # [ENTROPY_WEIGHT] Q3 软加权：低置信度样本降低该步有效学习率（不丢样本）
+        #   w=(H_ema/H)^gamma，再除以 w 的 EMA ⇒ 只做再分配、不改整体步长；clamp [0.2,2.0]
+        #   门控：env MOE_ENT_W=1（默认关 ⇒ 与历史完全一致）；gamma = config.ent_w_gamma（默认 0.5）
+        import os
+        if os.environ.get("MOE_ENT_W", "0") == "1" and os.environ.get("MOE_ENTW_SCOPE", "both").strip().lower() != "slow":
+            try:
+                _H = float(e_loss.detach().item())
+            except Exception:
+                _H = 0.0
+            if getattr(self, "_ent_H_ema", None) is None:
+                self._ent_H_ema, self._ent_w_ema = max(_H, 1e-6), 1.0
+            _gam = float(self.config.get("ent_w_gamma", 0.5))
+            _mode = os.environ.get("MOE_ENTW_MODE", "soft").strip().lower()
+            if _mode == "hard":
+                _w = 0.0 if _H > float(self.config.get("ent_w_hard_k", 1.5)) * self._ent_H_ema else 1.0
+            else:
+                _w = (self._ent_H_ema / max(_H, 1e-6)) ** _gam
+                _w = min(max(_w / max(self._ent_w_ema, 1e-6), 0.2), 2.0)
+            loss = loss * _w
+            self._ent_n = getattr(self, "_ent_n", 0) + 1
+            if _w < 0.5:
+                self._ent_drop = getattr(self, "_ent_drop", 0) + 1
+            if self._ent_n % 500 == 0:
+                print("[ENT_W] n=%d | 丢弃步数(w<0.5)=%d (%.1f%%) | H=%.4f H_ema=%.4f | mode=%s"
+                      % (self._ent_n, getattr(self, "_ent_drop", 0),
+                         100.0 * getattr(self, "_ent_drop", 0) / self._ent_n, _H, self._ent_H_ema, _mode), flush=True)
+            self._ent_H_ema = 0.99 * self._ent_H_ema + 0.01 * _H
+            self._ent_w_ema = 0.99 * self._ent_w_ema + 0.01 * _w
+            record["ent_w"] = _w
+            if not getattr(self, "_ent_w_logged", False):
+                print("[ENT_W] 软加权启用 | gamma=%.2f | 首样本 H=%.4f w=%.4f" % (_gam, _H, _w), flush=True)
+                self._ent_w_logged = True
+
+        # EXP-K: 恢复官方 MoETTA 的 LB 项——给 router 一条“一阶直连 route_prob”的学习信号。
+        # 说明：moe_model.forward 已算出 self.moe_lb_loss = lb_coeff * Σ_layers lb_loss
+        #      （lb_coeff 取 config.moetta.lb_coeff=0.2 且 dynamic_lb 自适应），这里只决定“加不加、放大多少”。
+        # 默认 lb_coef=0.0 → 与 EXP-F 行为完全一致（可复现历史结果）；>0 时启用。
+        lb_coef = float(self.config.get("lb_coef", 0.0))
+        moe_lb = getattr(self.model, "moe_lb_loss", None)
+        if lb_coef > 0 and moe_lb is not None:
+            loss = loss + lb_coef * moe_lb
+            record["lb_loss"] = float(moe_lb.item())
+            record["lb_coef"] = lb_coef
+            record["lb_term"] = lb_coef * float(moe_lb.item())
 
         record["total_loss"] = loss.item()
 

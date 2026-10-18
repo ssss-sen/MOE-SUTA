@@ -154,6 +154,10 @@ class DynamicResetSystem(object):
         return [x - y for x, y in zip(domain_losses, init_losses)]
     
     def _build_stat_model(self, data: list):
+        if self.timestep % 100 == 0:
+            print("DSUTA_TRACE_STATE t=%d t_last_reset=%d K=%d nstats=%d stat_model=%s"
+                  % (self.timestep, self.t_last_reset, self.K, len(self.domain_stats),
+                     "None" if self.stat_model is None else "built"), flush=True)
         if self.timestep + 1 == self.t_last_reset + self.K // 2:
             self.system.snapshot("domain")
         elif self.t_last_reset + self.K // 2 <= self.timestep + 1 < self.t_last_reset + self.K:
@@ -188,7 +192,7 @@ class DynamicResetSystem(object):
         data_stat = statistics.mean(self._collect_improvement_stats(data, "domain"))
         # p = self.stat_model.get_prob(data_stat, reduction=len(data))
         deviation = self.stat_model.get_deviation(data_stat, reduction=len(data))
-        # print(f"Stat: {data_stat}, deviation={deviation}")
+        print(f"Stat: {data_stat}, deviation={deviation}", flush=True)
         
         # if p > 0.9999366575:  # +4std
         # if p > 0.9544997361: # +2std

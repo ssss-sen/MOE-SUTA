@@ -15,7 +15,8 @@ class MOE_SUTAStrategy(IStrategy):
         self.system.eval()
     
     def _init_start(self, sample) -> None:
-        self.system.load_snapshot("init")
+        # EXP-G：连续适应（CSUTA 式），叠加在 EXP-F 的 SUTA 原版 loss 之上
+        pass
     
     def _adapt(self, sample):
         self.system.eval()

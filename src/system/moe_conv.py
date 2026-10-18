@@ -13,7 +13,8 @@ def fuse_conv_params(
     coeff: torch.Tensor,
     shared_weight: torch.Tensor,
     shared_bias: torch.Tensor,
-    has_bias: bool
+    has_bias: bool,
+    add_shared: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     针对 Conv 权重的融合逻辑。
@@ -33,11 +34,15 @@ def fuse_conv_params(
     
     # gather: 选出对应的专家权重并乘以系数
     selected_weight = ew_flat.unsqueeze(0).expand(B, -1, -1).gather(1, expanded_topks_w)
-    selected_coeff = coeff.unsqueeze(-1)
+    # [FUSE_TOPK_PATCH] K>1 先按 topks gather（旧写法只对 K=1 成立；K=1 数学等价 ⇒ 默认不变）
+    selected_coeff = coeff.gather(1, topks).unsqueeze(-1)
     fused_weight = (selected_weight * selected_coeff).sum(dim=1)
     
-    # 加上共享权重并还原形状
-    final_weight = fused_weight + shared_weight.view(-1).unsqueeze(0)
+    # 加上共享权重并还原形状（[EXPERT_INIT_PATCH] add_shared=False ⇒ 专家替换基座）
+    if add_shared:
+        final_weight = fused_weight + shared_weight.view(-1).unsqueeze(0)
+    else:
+        final_weight = fused_weight
     final_weight = final_weight.view(B, *w_shape)
 
     # 2. 融合偏置 (如果有)
@@ -49,7 +54,10 @@ def fuse_conv_params(
         selected_bias = eb_flat.unsqueeze(0).expand(B, -1, -1).gather(1, expanded_topks_b)
         fused_bias = (selected_bias * selected_coeff).sum(dim=1)
         
-        final_bias = fused_bias + shared_bias.view(-1).unsqueeze(0)
+        if add_shared:
+            final_bias = fused_bias + shared_bias.view(-1).unsqueeze(0)
+        else:
+            final_bias = fused_bias
         final_bias = final_bias.view(B, *b_shape)
     else:
         # TorchScript 要求返回相同类型的张量，所以返回一个空的张量
@@ -206,6 +214,17 @@ class MoEConv1dLayer(nn.Module):
         self.lb_loss = None
         self.route_prob_list = []
         self.record_route = False
+        self.force_random = False
+        # [BR] batch 级路由：用"跨样本统计量"(EMA) 做专家决策（卷积层同样支持）
+        self.batch_route = False
+        self.br_momentum = 0.5
+        self._br_ema = None
+        self._br_acc = None
+        self._br_n = 0
+        # [ORACLE] 强制专家号（None = 正常路由）
+        self.force_expert = None
+        # [RG] 路由粒度："native"(逐块) / "sample"(整条样本一个决策)
+        self.route_granularity = "native"
 
 
 
@@ -222,113 +241,118 @@ class MoEConv1dLayer(nn.Module):
         self.coeff = coeff if self.pass_through_coeff else coeff.detach()
 
     def get_topks(self, x: torch.Tensor):
-        """
-        按帧率切块（Block-wise）计算路由分布。
+        """逐样本路由：整条音频只做一次专家决策。
+
+        统计量 = 音频每秒的均值再对秒数求平均（与历史逐位一致，故结果可比）；
+        决策/系数形状一律 [B, K] / [B, E]。
         x shape: [B, in_C, L]
-        返回: 动态切分的 block 数量
         """
         B, in_C, L = x.shape
-        # 根据本层一秒的时长推断需要分为多少个Block
         fps = max(1, int(self.frames_per_sec))
-        num_blocks = math.ceil(L / fps)
-
-        # 将序列补齐到帧率的整数倍，方便路由池化
+        nb = math.ceil(L / fps)
         pad_len = (fps - (L % fps)) % fps
         x_pad_route = F.pad(x, (0, pad_len))
-        
-        # 重塑并对每个 Block 在时间维度上求均值: [B, in_C, num_blocks, F] -> [B, num_blocks, in_C]
-        x_blocks = x_pad_route.view(B, in_C, num_blocks, fps)
-        block_feats = x_blocks.mean(dim=-1).transpose(1, 2)
-        
-        # 展平为 [B*num_blocks, in_C] 进行路由预测
-        flat = block_feats.reshape(B * num_blocks, in_C)
-        prob = F.softmax(self.router(flat), dim=-1)
-        
+        chunk_means = x_pad_route.view(B, in_C, nb, fps).mean(dim=-1).transpose(1, 2)   # [B, nb, in_C]
+        flat = chunk_means.mean(dim=1)                                                  # [B, in_C] <- 每样本一个统计量
+
+        route_in = flat
+        if getattr(self, "batch_route", False):
+            cur = flat.detach().mean(0, keepdim=True)
+            self._br_acc = cur if self._br_acc is None else self._br_acc + cur
+            self._br_n += 1
+            if self._br_ema is not None:
+                route_in = self._br_ema.expand(flat.shape[0], -1)
+
+        prob = F.softmax(self.router(route_in), dim=-1)          # [B, E]
         biased = prob - self.penalty
-        vals, topks = torch.topk(biased, self.topk, dim=-1)
-        
-        coeff = torch.zeros_like(prob)
-        if self.weight_by_prob:
-            coeff.scatter_(1, topks, vals / vals.detach().sum(-1, keepdim=True))
+        fe = getattr(self, "force_expert", None)
+        if fe is not None:
+            topks = torch.full((biased.size(0), self.topk), int(fe), dtype=torch.long, device=biased.device)
+            vals = biased.gather(1, topks)
+        elif getattr(self, "force_random", False):
+            topks = torch.randint(0, self.num_expert, (biased.size(0), self.topk), device=biased.device)
+            vals = biased.gather(1, topks)
         else:
-            coeff.scatter_(1, topks, vals / vals.detach())
-            
-        # 统计平衡
+            vals, topks = torch.topk(biased, self.topk, dim=-1)
+
+        # ---- 融合口径：原 [FUSE_MODE_PATCH] / [FUSE_TOPK_PATCH] / [FUSE_SCALE_PATCH] 逻辑原样保留 ----
+        _fm = getattr(self, "fuse_mode", "topk")
+        if _fm in ("sum", "prob", "mean"):
+            topks = torch.arange(self.num_expert, device=prob.device).unsqueeze(0).expand(biased.size(0), -1).contiguous()
+            vals = prob.gather(1, topks)
+            _wbp = (_fm == "prob")
+        else:
+            _wbp = self.weight_by_prob
+        _fk = int(getattr(self, "fuse_topk", 0) or 0)
+        _is_mean = (_fm == "mean")
+        if 0 < _fk <= self.num_expert:
+            topks = torch.topk(biased, _fk, dim=-1)[1]
+            vals = prob.gather(1, topks)
+            _wbp = True
+            _is_mean = False
+        coeff = torch.zeros_like(prob)
+        if fe is not None:
+            _cval = torch.ones_like(vals)
+        elif _is_mean:
+            _cval = torch.full_like(vals, 1.0 / self.num_expert)
+        elif _wbp:
+            _cval = vals / vals.detach().sum(-1, keepdim=True)
+        else:
+            _cval = vals / vals.detach()
+        coeff.scatter_(1, topks, _cval)
+        _fs = float(getattr(self, "fuse_scale", 1.0))
+        if _fs != 1.0:
+            coeff = coeff * _fs
+
+        # ---- 统计平衡 + LB：样本级计数；cnt/cnt.sum() 尺度不变（route_penalty=0 时 penalty 恒 0）----
         cnt = torch.bincount(topks.flatten(), minlength=self.num_expert)
         self.cnt += cnt
         self.penalty += cnt * self.route_penalty / (1 + self.decay * self.step)
         self.penalty -= self.penalty.min()
-        
-        # 计算 LB Loss (使用平均重要性)
         importance = prob.mean(dim=0)
         self.lb_loss = self.num_expert * torch.sum(importance * (cnt / cnt.sum()))
-        
+
         self.update_coeff(coeff)
         self.topks = topks
         if self.record_route:
             self.route_prob_list.append(prob.detach().cpu())
-        
-        return num_blocks
+
+    def update_batch_stats(self):
+        """[BR] 把本样本累积的统计量并入 batch 级 EMA（策略在每个样本适应结束时调用）"""
+        if not getattr(self, "batch_route", False) or self._br_acc is None:
+            return
+        cur = self._br_acc / max(1, self._br_n)
+        self._br_ema = cur if self._br_ema is None else (
+            (1.0 - self.br_momentum) * self._br_ema + self.br_momentum * cur)
+        self._br_acc = None
+        self._br_n = 0
+
+    def reset_batch_stats(self):
+        """[BR] 清空 batch 级 EMA（每条流开始时调用）"""
+        self._br_ema = None
+        self._br_acc = None
+        self._br_n = 0
 
     def step_once(self):
         self.step += 1
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """MoE 卷积：每条样本一次专家决策，融合一次权重后做一次分组卷积。"""
         B, in_C, L = x.shape
-        
         if self.router is not None:
-            num_blocks = self.get_topks(x)
-        else:
-            num_blocks = math.ceil(L / max(1, self.frames_per_sec))
-            
-        # topks 和 coeff 现在的形状都是 [B * num_blocks, K 或 E]
-        # 融合出每一块专属于该时段的权重: shape = [B * num_blocks, out_C, in_C/g, K]
+            self.get_topks(x)          # 只产生一次决策：self.topks [B,K] / self.coeff [B,E]
+        assert self.topks is not None and self.coeff is not None, \
+            "[SAMPLE_LEVEL] 需要路由器，或由外部注入的 coeff/topks"
+        assert self.topks.dim() == 2 and self.coeff.dim() == 2, \
+            "[SAMPLE_LEVEL] 只支持样本级 2D 路由（[B,K]/[B,E]）"
+
         final_weight, final_bias = fuse_conv_params(
             self.experts_weight, self.experts_bias, self.topks,
-            self.coeff, self.weight, self.bias, self.has_bias
+            self.coeff, self.weight, self.bias, self.has_bias,
+            not getattr(self, "no_shared", False)
         )
-
-        # =============== 无边界伪影的 Block-wise 动态卷积 ===============
-        P = self.padding
-        D = self.dilation
-        S = self.stride
-        K_size = final_weight.size(-1)
-        K_eff = (K_size - 1) * D + 1
-        
-        # 1. 计算理论上正常 Conv1d 应该输出的长度
-        L_out_total = (L + 2 * P - K_eff) // S + 1
-        
-        # 2. 将输出均匀切分为 num_blocks 个块
-        F_out_chunk = math.ceil(L_out_total / num_blocks)
-        
-        # 3. 逆向计算每个输出块所需的确切输入窗口大小 (涵盖必要的重叠上下文)
-        L_in_chunk = (F_out_chunk - 1) * S + K_eff
-        
-        # 4. 像常规 Conv1d 一样在两端做 Padding
-        x_pad = F.pad(x, (P, P))
-        
-        # 5. 为了防止最后一个滑动窗口超出边界，向右补充足够的长度
-        required_len = (num_blocks - 1) * (F_out_chunk * S) + L_in_chunk
-        if x_pad.size(-1) < required_len:
-            x_pad = F.pad(x_pad, (0, required_len - x_pad.size(-1)))
-            
-        # 6. 利用 unfold 提取滑动窗口，提取出包含重叠信息的完美 Block 序列
-        # 输出: [B, in_C, num_blocks, L_in_chunk]
-        x_unfold = x_pad.unfold(dimension=-1, size=L_in_chunk, step=F_out_chunk * S)
-        
-        # 7. 转置并重塑，把 Batch 维度和 Block 维度合并 -> [B * num_blocks, in_C, L_in_chunk]
-        x_unfold = x_unfold.transpose(1, 2).contiguous().view(B * num_blocks, in_C, L_in_chunk)
-        
-        # 8. 执行分组动态卷积（此时 Padding=0，因为 x_unfold 已经包含填充上下文）
-        out_chunks = apply_dynamic_conv1d(
-            x_unfold, final_weight, final_bias, 
-            S, 0, D, self.groups, self.has_bias
-        ) # 输出形状: [B * num_blocks, out_C, F_out_chunk]
-        
-        # 9. 还原维度并拼接 -> [B, out_C, num_blocks * F_out_chunk]
-        out_C = out_chunks.size(1)
-        out = out_chunks.view(B, num_blocks, out_C, F_out_chunk)
-        out = out.transpose(1, 2).reshape(B, out_C, num_blocks * F_out_chunk)
-        
-        # 10. 切去多余部分，使长度与标准卷积输出百分之百对齐
-        return out[:, :, :L_out_total]
+        if not getattr(self, "_sample_level_logged", False):
+            print("[SAMPLE_LEVEL] 样本级路由：单次融合 + 一次普通卷积", flush=True)
+            self._sample_level_logged = True
+        return apply_dynamic_conv1d(x, final_weight, final_bias, self.stride, self.padding,
+                                    self.dilation, self.groups, self.has_bias)

@@ -29,6 +29,7 @@ OTHER = {
 
 MOESUTA = {
     "moe_suta": (f"{SRC_DIR}/moe_suta.py", "MOE_SUTAStrategy"),
+    "moe_dsuta": (f"{SRC_DIR}/moe_dsuta.py", "MOE_DSUTAStrategy"),
 }
 
 STRATEGY_MAPPING = {

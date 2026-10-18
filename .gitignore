@@ -162,3 +162,18 @@ cython_debug/
 wandb/
 _*/
 results/
+
+# ==== project: run artifacts / backups / one-off scripts ====
+*.nohup
+*.pkl
+*.pt
+*.ckpt
+*.bak_*
+*.bak
+*.reverted
+*_discard_*
+/patch_*.py
+/_t_*.py
+/_fix_*.py
+prog.sh
+sl_batch.log
