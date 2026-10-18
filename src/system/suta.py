@@ -4,10 +4,32 @@ import torch.nn as nn
 from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
 from copy import deepcopy
 import json
+import os
 
 from ..utils.tool import batchify
 from .loss import softmax_entropy, mcc_loss, div_loss
 from .moe_model import MoETTA
+
+
+def _suta_snap_dev():
+    """SUTA_SNAP_MODE=cpu 时快照落在主机内存；默认留在显存（原版行为）。"""
+    if os.environ.get("SUTA_SNAP_MODE", "gpu").strip().lower() == "cpu":
+        return torch.device("cpu")
+    return None
+
+
+def _suta_snap_to(dev, obj):
+    """dev=None 时走原来的 deepcopy；否则复制到指定设备（copy=True 保证只拷一次）。"""
+    if dev is None:
+        return deepcopy(obj)
+    if torch.is_tensor(obj):
+        return obj.detach().to(dev, copy=True)
+    if isinstance(obj, dict):
+        return {k: _suta_snap_to(dev, v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_suta_snap_to(dev, v) for v in obj)
+    return obj
+
 
 def parse_layer_string(layer_str):
     if not layer_str:
@@ -629,10 +651,11 @@ class SUTASystem(object):
     def snapshot(self, key: str):
         """Copy the model and optimizer states for resetting after adaptation."""
         # print(f"Store state. (key: {key})")
-        model_state = deepcopy(self.model.state_dict())
-        optimizer_state = deepcopy(self.optimizer.state_dict())
+        _dev = _suta_snap_dev()
+        model_state = _suta_snap_to(_dev, self.model.state_dict())
+        optimizer_state = _suta_snap_to(_dev, self.optimizer.state_dict())
         if self.scheduler is not None:
-            scheduler_state = deepcopy(self.scheduler.state_dict())
+            scheduler_state = _suta_snap_to(_dev, self.scheduler.state_dict())
         else:
             scheduler_state = None
         self.history[key] = (model_state, optimizer_state, scheduler_state)

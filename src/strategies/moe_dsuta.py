@@ -10,11 +10,13 @@ MoE-DSUTA：把 MoE 层放进 DSUTA 的框架（快慢双模型 + 缓冲区 + �
 
 与 src/strategies/dsuta.py 的区别：
     1) 适应用 moe_suta_adapt / moe_suta_adapt_auto（MoE loss，含 EXP-K 的 lb_coef）；
-    2) 快照存 CPU（省 GPU 显存；load_state_dict 会按参数设备自动搬运）。
+    2) 快照默认存 CPU（省 GPU 显存）；MOE_SNAP_MODE=gpu 时留在 GPU，与 DSUTA 的 deepcopy 快照一致。
 
 注意：_moe_suta_adapt_loss_only 的 loss 部分是从 src/system/suta.py::moe_suta_adapt
 逐行复制的（去掉 zero_grad/backward/step，用于梯度累积）。若改动 suta.py 的 loss，这里要同步。
 """
+import os
+from copy import deepcopy
 import torch
 from torch.utils.data import Dataset
 from tqdm import tqdm
@@ -192,7 +194,9 @@ SUTASystem.moe_suta_adapt_auto = _moe_suta_adapt_auto
 # ------------------------------------------------------------------ CPU 快照
 def _to_cpu(obj):
     if torch.is_tensor(obj):
-        return obj.detach().to("cpu").clone()
+        # to("cpu") 已经产生新张量，再 clone() 是第二次拷贝；copy=True 保证只有一次，
+        # 数值与原来逐位相同（只是少了一次 memcpy）。
+        return obj.detach().to("cpu", copy=True)
     if isinstance(obj, dict):
         return {k: _to_cpu(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
@@ -200,17 +204,130 @@ def _to_cpu(obj):
     return obj
 
 
+def _snap_mode():
+    """快照存放位置：cpu（历史行为，走 PCIe）或 gpu（与 DSUTA 的 deepcopy 一致）。"""
+    return os.environ.get("MOE_SNAP_MODE", "cpu").strip().lower()
+
+
+def _to_dev(obj, dev):
+    """递归把 state_dict 复制到指定设备；to(copy=True) 保证每个张量只拷一次。"""
+    if torch.is_tensor(obj):
+        return obj.detach().to(dev, copy=True)
+    if isinstance(obj, dict):
+        return {k: _to_dev(v, dev) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_to_dev(v, dev) for v in obj)
+    return obj
+
+
+def _step_keep_cpu(opt_state):
+    """Adam 的 step 计数器原生常驻 CPU（capturable=False 时是 torch.tensor(0.0)）。
+
+    GPU 快照会把它一起搬到显存，而 load_state_dict 对 step 不做设备转换，
+    于是读档后 step 留在显卡上，和原生实现的运算路径不一致。这里把它搬回 CPU。
+    """
+    st = opt_state.get("state", {}) if isinstance(opt_state, dict) else {}
+    n = 0
+    for v in st.values():
+        if isinstance(v, dict) and "step" in v and torch.is_tensor(v["step"]):
+            if v["step"].device.type != "cpu":
+                v["step"] = v["step"].detach().to("cpu", copy=True)
+                n += 1
+    if n and not globals().get("_STEP_CPU_LOGGED", False):
+        print("[SNAP] step 计数器保持 CPU（搬回 %d 个）" % n, flush=True)
+        globals()["_STEP_CPU_LOGGED"] = True
+    return opt_state
+
+
+def _snap_trainable_only():
+    return os.environ.get("MOE_SNAP_TRAINABLE_ONLY", "0").strip() == "1"
+
+
+def _snap_use_pinned():
+    return os.environ.get("MOE_SNAP_PINNED", "0").strip() == "1"
+
+
+def _snap_model_state(system):
+    """快照里要存的模型状态。
+
+    MOE_SNAP_TRAINABLE_ONLY=1 时只保留可训练参数 + 非空 buffer：冻结参数在整条流里
+    不会被改动，回滚它们是空操作，去掉能省一半以上的搬运量。
+    """
+    sd = system.model.state_dict()
+    if not _snap_trainable_only():
+        return sd
+    pn = dict(system.model.named_parameters())
+    out = {}
+    for k, v in sd.items():
+        if k in pn:
+            if pn[k].requires_grad:
+                out[k] = v
+        elif getattr(v, "numel", lambda: 0)() > 0:
+            out[k] = v
+    return out
+
+
+def _to_pinned(obj):
+    """把 CPU 副本放到锁页内存上（PCIe 传输更快）。"""
+    if torch.is_tensor(obj):
+        src = obj.detach()
+        if src.device.type != "cuda":
+            return src.to("cpu", copy=True)
+        out = torch.empty(src.shape, dtype=src.dtype, device="cpu", pin_memory=True)
+        out.copy_(src, non_blocking=False)
+        return out
+    if isinstance(obj, dict):
+        return {k: _to_pinned(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_to_pinned(v) for v in obj)
+    return obj
+
+
+def _snap_copy(obj):
+    """CPU 口径复制入口：MOE_SNAP_PINNED=1 时走锁页内存。"""
+    return _to_pinned(obj) if _snap_use_pinned() else _to_cpu(obj)
+
+
 def snapshot_cpu(system, key):
-    """把 (模型状态, 优化器状态) 存到 CPU；替换掉 SUTASystem 默认的 GPU deepcopy 快照。"""
+    """把 (模型状态, 优化器状态) 存一份副本。
+
+    MOE_SNAP_MODE=gpu 时副本留在 GPU（和 DSUTA 的 deepcopy 快照一致，免掉 PCIe 往返）；
+    默认 cpu 保持历史行为，走 _to_cpu。
+    """
+    if _snap_mode() == "gpu":
+        try:
+            dev = next(system.model.parameters()).device
+        except StopIteration:
+            dev = torch.device("cpu")
+        opt_state = None
+        if getattr(system, "optimizer", None) is not None:
+            opt_state = _step_keep_cpu(_to_dev(system.optimizer.state_dict(), dev))
+        system.history[key] = (_to_dev(_snap_model_state(system), dev), opt_state, None)
+        if not globals().get("_SNAP_GPU_LOGGED", False):
+            print("[SNAP] mode=gpu（副本留在 %s，不走 PCIe）" % dev, flush=True)
+            globals()["_SNAP_GPU_LOGGED"] = True
+        return
     opt_state = None
     if getattr(system, "optimizer", None) is not None:
-        opt_state = _to_cpu(system.optimizer.state_dict())
-    system.history[key] = (_to_cpu(system.model.state_dict()), opt_state, None)
+        opt_state = _snap_copy(system.optimizer.state_dict())
+    system.history[key] = (_snap_copy(_snap_model_state(system)), opt_state, None)
 
 
 def load_snapshot_cpu(system, key):
     model_state, opt_state, _ = system.history[key]
-    system.model.load_state_dict(model_state, strict=True)
+    if _snap_trainable_only():
+        _pn = dict(system.model.named_parameters())
+        _miss = [n for n, p in _pn.items() if p.requires_grad and n not in model_state]
+        if _miss:
+            raise KeyError("[SNAP] 快照缺少 %d 个可训练参数，例如 %s" % (len(_miss), _miss[:3]))
+        system.model.load_state_dict(model_state, strict=False)
+    else:
+        system.model.load_state_dict(model_state, strict=True)
+    if _snap_mode() == "gpu" and opt_state is not None:
+        # 快照留在 GPU 时，optimizer.load_state_dict 在设备/dtype 已经匹配的情况下不会复制张量，
+        # 而是把快照里的张量直接挂到优化器状态上；随后 Adam 的原地更新会把快照本身改写掉。
+        # 所以喂进去之前必须先深拷贝一份（DSUTA 原版 load_snapshot 也是这么做的）。
+        opt_state = deepcopy(opt_state)
     if opt_state is not None and getattr(system, "optimizer", None) is not None:
         # [FS_SLOW_PATCH] 只接收 Adam state; PyTorch load_state_dict 会用保存方的
         #   param_groups 超参覆盖接收方 => 会把慢模型 shared 组 lr=0 复制到快模型。
@@ -403,6 +520,7 @@ class MOE_DSUTAStrategy(IStrategy):
             print("[FAST_MASK] enable: fast path updates SHARED + top-1 expert only (router/other experts frozen)", flush=True)
 
         self.timestep = 0
+        self._cks_path = os.environ.get('MOE_CKSUM', '').strip()
         self.update_freq = self.strategy_config.get("update_freq", 5)
         self.memory = Buffer(max_size=self.strategy_config.get("memory", 5))
 
@@ -615,6 +733,33 @@ class MOE_DSUTAStrategy(IStrategy):
         print("[DYN_RESET] RESET #%d at timestep=%d (dev=%.2f, partial=%s)"
               % (self._dyn_n, self.timestep, dev, _pm if _done else "none"), flush=True)
 
+
+        # [RESET_AUDIT] 重置刚做完时把状态打出来，供 CPU / GPU 两种快照口径逐项对比。
+        # 部分重置的定义就是"把 shared 恢复到 init 快照"，所以这里与 init 的差异必须是 0。
+        _ap = os.environ.get("MOE_RESET_AUDIT", "").strip()
+        if _ap:
+            try:
+                _sy = self.slow_system
+                _init = _sy.history["init"][0]
+                _sk, _sp, _ek, _ep, _nk, _npp = self._dyn_partial_sets(_sy)
+                _sd = _sy.model.state_dict()
+                _dmax, _dworst = 0.0, "none"
+                for _k in _sk:
+                    if _k in _init and _k in _sd:
+                        _d = (_sd[_k].float().cpu() - _init[_k].float().cpu()).abs().max().item()
+                        if _d > _dmax:
+                            _dmax, _dworst = _d, _k
+                _vec = torch.cat([p.detach().float().reshape(-1) for p in _sp]) if _sp else None
+                _norm = float(_vec.norm().item()) if _vec is not None else -1.0
+                _sumn = float(_vec.sum().item()) if _vec is not None else -1.0
+                _nadam = sum(1 for _p in _sp if _p in _sy.optimizer.state)
+                _lrs = [g.get("lr") for g in _sy.optimizer.param_groups]
+                with open(_ap, "a", encoding="utf-8") as _f:
+                    _f.write("RESET#%d t=%d | shared=%d | vs init max|d|=%.6e (%s) | norm=%.12e sum=%.12e | 残留Adam=%d | lr=%s\n"
+                             % (self._dyn_n, self.timestep, len(_sk), _dmax, _dworst,
+                                _norm, _sumn, _nadam, _lrs))
+            except Exception as _e:
+                print("[RESET_AUDIT] failed: %s" % _e, flush=True)
         # [SLOWCOMMIT] 重置后开窗（MOE_SB_WIN=0 => 不开）
         if getattr(self, "_sb_win", 0) > 0:
             self._sb_until = self.timestep + self._sb_win
@@ -666,8 +811,37 @@ class MOE_DSUTAStrategy(IStrategy):
             n_ok += 1
         return n_ok, n_miss
 
+    def _restore_start(self, system, key="start"):
+        """从 start 快照恢复。
+
+        MOE_START_RESTORE=shared（默认 all 保持原行为）时只恢复 shared 那 30 个张量，
+        并清掉它们的 Adam 状态；专家与路由继续累积，不做回滚。
+        """
+        if os.environ.get("MOE_START_RESTORE", "all").strip().lower() != "shared":
+            load_snapshot_cpu(system, key)
+            return
+        sd = system.history[key][0]
+        _sk, _sp, _ek, _ep, _nk, _npp = self._dyn_partial_sets(system)
+        sel = {k: sd[k] for k in _sk if k in sd}
+        if not sel:
+            load_snapshot_cpu(system, key)
+            return
+        system.model.load_state_dict(sel, strict=False)
+        for _p in _sp:
+            system.optimizer.state.pop(_p, None)
+        if not globals().get("_START_SHARED_LOGGED", False):
+            print("[START_RESTORE] shared 模式：每次只回滚 %d 个共享张量（专家/路由累积）" % len(sel), flush=True)
+            globals()["_START_SHARED_LOGGED"] = True
+
+    def _restore_commit(self, system, key="start"):
+        """commit 处的恢复：MOE_COMMIT_RESTORE=all（默认）全量；=shared 只回滚 shared。"""
+        if os.environ.get("MOE_COMMIT_RESTORE", "all").strip().lower() == "shared":
+            self._restore_start(system, key)
+            return
+        load_snapshot_cpu(system, key)
+
     def _init_start(self, sample):
-        load_snapshot_cpu(self.system, "start")
+        self._restore_start(self.system, "start")
 
     def _adapt(self, sample):
         self.system.eval()
@@ -740,7 +914,7 @@ class MOE_DSUTAStrategy(IStrategy):
                     print("[SLOWCOMMIT] batch #%d t=%d buffer=%d batch=%d"
                           % (self._sb_c, self.timestep, _sb_b,
                              _sb_b if self._sbatch == -1 else min(self._sbatch, _sb_b)), flush=True)
-            load_snapshot_cpu(self.slow_system, "start")
+            self._restore_commit(self.slow_system, "start")
             self.slow_system.eval()
             record = {}
             _seg_wavs = [s["wav"] for s in self.memory.data]
@@ -875,6 +1049,8 @@ class MOE_DSUTAStrategy(IStrategy):
                 except Exception as _e:
                     print("[DYN_RESET] build failed: %s" % _e, flush=True)
             self.timestep += 1
+            if getattr(self, '_cks_path', ''):
+                self._cksum_dump()
 
         print("#Too long: ", long_cnt)
         if getattr(self, "_leak_beta", 0.0) > 0:
@@ -936,6 +1112,16 @@ class MOE_DSUTAStrategy(IStrategy):
             print("[DYN_RESET] total resets=%d" % self._dyn_n, flush=True)
         return {"wers": errs, "n_words": n_words,
                 "transcriptions": transcriptions, "losses": losses}
+
+    def _cksum_dump(self):
+        """每样本记录慢模型可训练参数的范数与和，用于逐样本对比两次运行是否走了同一条轨迹。"""
+        ps = [p.detach().float().reshape(-1) for p in self.slow_system.model.parameters()
+              if p.requires_grad]
+        if not ps:
+            return
+        v = torch.cat(ps)
+        with open(self._cks_path, "a") as f:
+            f.write("%d %.12e %.12e\n" % (self.timestep, float(v.norm().item()), float(v.sum().item())))
 
     def get_adapt_count(self):
         return self.system.adapt_count + self.slow_system.adapt_count
